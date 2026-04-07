@@ -1,0 +1,330 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * astm — CLI tool for the orderlyconnect/astm-e1394-91 library.
+ *
+ * Usage:
+ *   astm parse   <file>                 Parse and display a plain-text ASTM file
+ *   astm decode  <file>                 Decode an LLP-framed binary ASTM file
+ *   astm verify  <file>                 Validate structure and report errors
+ *   astm json    <file>                 Output message(s) as JSON
+ *   astm summary <file>                 Cross-session statistics (batch files)
+ *   astm help                           Show this help
+ *
+ * Examples:
+ *   astm parse  /tmp/result.astm
+ *   astm decode /tmp/capture.bin
+ *   astm json   /tmp/result.astm | jq '.results[] | select(.flag != "N")'
+ */
+
+declare(strict_types=1);
+
+// Find the autoloader — support both local development and global install
+$autoloaders = [
+    __DIR__ . '/../vendor/autoload.php',       // local: src/bin/astm
+    __DIR__ . '/../../autoload.php',            // global composer install
+    __DIR__ . '/../../../autoload.php',
+];
+
+$loaded = false;
+foreach ($autoloaders as $autoloader) {
+    if (file_exists($autoloader)) {
+        require $autoloader;
+        $loaded = true;
+        break;
+    }
+}
+
+if (!$loaded) {
+    fwrite(STDERR, "Error: cannot find vendor/autoload.php. Run `composer install` first.\n");
+    exit(1);
+}
+
+use Astm\Astm;
+use Astm\Message;
+use Astm\MessageCollection;
+use Astm\Records\Result;
+
+// ---------------------------------------------------------------------------
+//  Entry point
+// ---------------------------------------------------------------------------
+
+$command = $argv[1] ?? 'help';
+$file    = $argv[2] ?? null;
+
+match ($command) {
+    'parse'   => cmdParse($file, llp: false),
+    'decode'  => cmdParse($file, llp: true),
+    'verify'  => cmdVerify($file),
+    'json'    => cmdJson($file),
+    'summary' => cmdSummary($file),
+    'help', '--help', '-h' => cmdHelp(),
+    default => (function () use ($command): never {
+        fwrite(STDERR, "Unknown command: {$command}\nRun `astm help` for usage.\n");
+        exit(1);
+    })(),
+};
+
+// ---------------------------------------------------------------------------
+//  Commands
+// ---------------------------------------------------------------------------
+
+function cmdParse(?string $file, bool $llp): never
+{
+    $collection = loadCollection($file, $llp);
+    $total      = count($collection);
+
+    if ($total === 0) {
+        echo "No messages found.\n";
+        exit(0);
+    }
+
+    foreach ($collection as $i => $msg) {
+        if ($total > 1) {
+            echo "\n══ Session " . ($i + 1) . " of {$total} ══\n";
+        }
+        printMessage($msg);
+    }
+    exit(0);
+}
+
+function cmdVerify(?string $file): never
+{
+    $collection = loadCollection($file, false);
+    $allOk      = true;
+
+    foreach ($collection as $i => $msg) {
+        $errors = Astm::validate($msg);
+        $n      = $i + 1;
+        if (empty($errors)) {
+            echo "Session {$n}: ✓ valid\n";
+        } else {
+            $allOk = false;
+            echo "Session {$n}: ✗ " . count($errors) . " error(s)\n";
+            foreach ($errors as $e) {
+                echo "  - {$e}\n";
+            }
+        }
+    }
+    exit($allOk ? 0 : 1);
+}
+
+function cmdJson(?string $file): never
+{
+    $collection = loadCollection($file, false);
+
+    if (count($collection) === 1) {
+        echo $collection->first()->toJson() . "\n";
+    } else {
+        $out = array_map(fn (Message $m) => $m->toArray(), iterator_to_array($collection));
+        echo json_encode($out, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT) . "\n";
+    }
+    exit(0);
+}
+
+function cmdSummary(?string $file): never
+{
+    $collection = loadCollection($file, false);
+    $total      = count($collection);
+
+    if ($total === 0) {
+        echo "No messages found.\n";
+        exit(0);
+    }
+
+    $abnormal = $collection->getAbnormalResults();
+    $flagged  = $collection->getMessagesWithAbnormalities();
+    $mapped   = $collection->getAllResultsMapped();
+
+    echo "┌─────────────────────────────────────────┐\n";
+    echo "│  ASTM Batch Summary                     │\n";
+    echo "└─────────────────────────────────────────┘\n";
+    printf("  Sessions   : %d\n", $total);
+    printf("  Abnormal   : %d result(s)\n", count($abnormal));
+    printf("  Flagged    : %d session(s)\n\n", count($flagged));
+
+    if (!empty($mapped)) {
+        echo "Per-test statistics:\n";
+        printf("  %-14s  %6s  %8s  %8s  %8s\n", 'Test', 'Count', 'Min', 'Max', 'Mean');
+        echo '  ' . str_repeat('─', 54) . "\n";
+
+        foreach ($mapped as $test => $entries) {
+            $nums = array_filter(
+                array_map(fn ($e) => is_numeric($e['value']) ? (float) $e['value'] : null, $entries),
+                fn ($v) => $v !== null,
+            );
+            if (empty($nums)) {
+                continue;
+            }
+            printf("  %-14s  %6d  %8.2f  %8.2f  %8.2f\n",
+                $test,
+                count($nums),
+                min($nums),
+                max($nums),
+                array_sum($nums) / count($nums),
+            );
+        }
+    }
+
+    if (!empty($flagged)) {
+        echo "\nFlagged sessions:\n";
+        foreach ($flagged as $msg) {
+            $p    = $msg->getFirstPatient();
+            $name = $p ? trim($p->getLastName() . ' ' . $p->getFirstName()) : '(no patient)';
+            echo "  {$name}\n";
+            foreach (array_filter($msg->getResults(), fn ($r) => $r->isAbnormal()) as $r) {
+                printf("    ⚠  %-12s %6s %-10s [%s]\n",
+                    $r->getTestName(), $r->getValue(),
+                    $r->getUnits(), $r->getAbnormalFlag());
+            }
+        }
+    }
+    exit(0);
+}
+
+function cmdHelp(): never
+{
+    $version = Astm::version();
+    echo <<<HELP
+astm {$version} — ASTM E1394-97 CLI (orderlyconnect/astm-e1394-91)
+
+Usage:
+  astm <command> <file>
+
+Commands:
+  parse   <file>    Parse a plain-text ASTM file and display results
+  decode  <file>    Decode an LLP-framed binary ASTM file and display results
+  verify  <file>    Validate message structure; exits 1 if errors found
+  json    <file>    Output message(s) as JSON (pipe to jq for filtering)
+  summary <file>    Cross-session batch statistics
+  help              Show this help
+
+Examples:
+  astm parse  /tmp/result.astm
+  astm decode /tmp/session.bin
+  astm verify /tmp/result.astm
+  astm json   /tmp/result.astm | jq '.results[] | select(.flag != "N")'
+  astm summary /tmp/batch.astm
+
+HELP;
+    exit(0);
+}
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+
+function loadCollection(?string $file, bool $llp): MessageCollection
+{
+    if ($file === null) {
+        fwrite(STDERR, "Error: no file specified.\n");
+        exit(1);
+    }
+    if (!file_exists($file)) {
+        fwrite(STDERR, "Error: file not found: {$file}\n");
+        exit(1);
+    }
+
+    try {
+        if ($llp) {
+            return Astm::decodeLlp((string) file_get_contents($file));
+        }
+        return Astm::parseFile($file);
+    } catch (\Astm\Exceptions\AstmException $e) {
+        fwrite(STDERR, "Parse error: " . $e->getMessage() . "\n");
+        exit(1);
+    }
+}
+
+function printMessage(Message $msg): void
+{
+    $header  = $msg->getHeader();
+    $patient = $msg->getFirstPatient();
+    $results = $msg->getResults();
+
+    // Header
+    echo "┌─────────────────────────────────────────────────\n";
+    if ($header) {
+        printf("│ Instrument  : %s\n", $header->getSenderName());
+        if ($header->getSenderId() !== '') {
+            printf("│ ID          : %s\n", $header->getSenderId());
+        }
+        if ($header->getSenderVersion() !== '') {
+            printf("│ Version     : %s\n", $header->getSenderVersion());
+        }
+        if ($dt = $header->getMessageDateTimeObject()) {
+            printf("│ Timestamp   : %s\n", $dt->format('Y-m-d H:i:s'));
+        }
+        printf("│ ASTM ver    : %s\n", $header->getVersionNumber());
+    }
+
+    // Patient
+    if ($patient) {
+        $name = trim($patient->getLastName() . ' ' . $patient->getFirstName());
+        printf("│ Patient     : %s (%s)\n", $name ?: '—', $patient->getSex());
+        if ($dob = $patient->getBirthdateObject()) {
+            printf("│ DOB         : %s\n", $dob->format('Y-m-d'));
+        }
+        if ($pid = $patient->getPracticePatientId()) {
+            printf("│ Patient ID  : %s\n", $pid);
+        }
+    }
+
+    echo "└─────────────────────────────────────────────────\n\n";
+
+    // Results table
+    $quantitative = array_filter($results, fn ($r) => $r->getValue() !== '');
+    $qualitative  = array_filter($results, fn ($r) => $r->getValue() === '' && $r->isAbnormal());
+
+    if (!empty($quantitative)) {
+        printf("  %-14s  %8s  %-12s  %-10s  %s\n", 'Test', 'Value', 'Units', 'Range', 'Flag');
+        echo '  ' . str_repeat('─', 60) . "\n";
+
+        foreach ($quantitative as $r) {
+            $flag = $r->getAbnormalFlag();
+            $icon = match (true) {
+                str_starts_with($flag, 'HH') => '▲▲',
+                str_starts_with($flag, 'H')  => '▲ ',
+                str_starts_with($flag, 'LL') => '▼▼',
+                str_starts_with($flag, 'L')  => '▼ ',
+                $flag === 'A' || $flag === 'W' => '! ',
+                default                       => '  ',
+            };
+            printf("  %-14s  %8s  %-12s  %-10s  %s%s\n",
+                $r->getTestName(),
+                $r->getValue(),
+                $r->getUnits(),
+                $r->getReferenceRange(),
+                $icon,
+                $flag,
+            );
+        }
+        echo "\n";
+    }
+
+    // Qualitative abnormalities (flags with no numeric value)
+    if (!empty($qualitative)) {
+        echo "  Instrument flags:\n";
+        foreach ($qualitative as $r) {
+            printf("  ! %s\n", $r->getTestName());
+        }
+        echo "\n";
+    }
+
+    // Comments
+    foreach ($msg->getComments() as $c) {
+        if ($c->getCommentText() !== '') {
+            echo "  ℹ  " . $c->getCommentText() . "\n";
+        }
+    }
+
+    // Summary line
+    $abnCount = count(array_filter($results, fn ($r) => $r->isAbnormal()));
+    if ($abnCount > 0) {
+        echo "  ⚠  {$abnCount} abnormal result(s)\n";
+    } else {
+        echo "  ✓  All results within reference range\n";
+    }
+    echo "\n";
+}

@@ -1,0 +1,9 @@
+/vendor/
+/composer.lock
+/.phpunit.result.cache
+/.phpunit.cache/
+*.astm
+*.bin
+*.log
+.DS_Store
+Thumbs.db
