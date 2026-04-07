@@ -10,7 +10,7 @@
 
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Instead, e-mail **security@orderlyconnect.com** with:
+Instead, e-mail **solutionsorderly@gmail.com** with:
 
 - A description of the vulnerability and its potential impact.
 - Steps to reproduce (or a proof-of-concept).
